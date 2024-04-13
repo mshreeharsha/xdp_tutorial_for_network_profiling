@@ -8,6 +8,10 @@
 #include <linux/ip.h>
 #include <linux/icmp.h>
 #include <linux/pkt_cls.h>
+#include <stdio.h>
+#define ICMP_CSUM_OFF (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct icmphdr, checksum))
+#define ICMP_PING 8
+#define ICMP_CSUM_SIZE sizeof(__u16)
 
 struct my_timestamp {
     __u16 magic;
@@ -58,7 +62,83 @@ static __always_inline int parse_iphdr(struct hdr_cursor *nh, void *data_end, st
 
     return iph->protocol;
 }
+/*
+static __always_inline int parse_icmphdr(struct hdr_cursor *nh, void *data_end, struct icmphdr **icmp_header){
 
+    struct icmphdr *icmphdr = nh->pos;
+    int hdrsize;
+
+    if (icmphdr + 1 > data_end)
+        return -1;
+
+    hdrsize = sizeof(*icmphdr);
+    if (nh->pos + hdrsize > data_end)
+        return -1;
+
+    bpf_printk("icmp type : %llu", icmphdr->type);
+    bpf_printk("icmp code : %llu", icmphdr->code);
+    bpf_printk("icmp checksum : %llu", icmphdr->checksum);
+    bpf_printk("icmp id : %llu", icmphdr->un.echo.id);
+    bpf_printk("icmp seq : %llu", icmphdr->un.echo.sequence);
+    bpf_printk("icmp gateway : %llu", icmphdr->un.gateway);
+    bpf_printk("icmp mtu : %llu", icmphdr->un.frag.mtu);
+    bpf_printk("icmp unused : %llu", icmphdr->un.frag.__unused);
+    for (int i =0; i < 4; i++)
+    {
+        bpf_printk("icmp reserved : %llu", icmphdr->un.reserved[i]);
+    }
+    
+    icmphdr->checksum = 0;
+    __u16 csum = 0;
+    for(int i=0;i<(hdrsize >> 1);i++){
+        csum += *((__u16 *)nh->pos);
+        nh->pos += sizeof(__u16);
+    }
+    bpf_printk("new hedaer checksum: %llu", csum);
+
+    if(((void *)nh->pos + 1) > data_end){
+        return -1;
+    }
+
+    int data_size = (void *)data_end - (void *)(nh->pos);
+    for(int i=0;i < (data_size >> 2);i++){
+        csum += *((__u16 *)nh->pos);
+        if(i == ((data_size >> 1)-1))break;
+        nh->pos += sizeof(__u16);
+    }
+    if((data_size % 2) != 0){
+        csum += ((*((__u8*)nh->pos))<<8);
+        nh->pos += sizeof(__u8);
+        // return -1;
+    }
+    
+    bpf_printk("new Body checksum: %llu", csum);
+
+    // if( nh->pos >= data_end || (nh->pos + sizeof(__u8)) >= data_end){
+    //     return -1;
+    // }
+    // while(1)  
+    // {
+    //     __u16* cur_16bit_val = nh->pos;
+    //     csum += *cur_16bit_val;
+    //     if((nh->pos + sizeof(__u8)) >= data_end){
+    //         __u8* cur_16bit_val = nh->pos;
+    //         csum += ((*cur_16bit_val)<<1);
+    //         break;
+    //     }
+    //     if(nh->pos + sizeof(__u16) >= data_end){
+    //         nh->pos += sizeof(__u16);
+    //         break;
+    //     }
+    //     nh->pos += sizeof(__u16);
+    // }
+
+    // bpf_printk(" checksum  full New: %llu", csum);
+    
+    *icmp_header = icmphdr;
+    return icmphdr->checksum;
+}
+*/
 SEC("tc")
 int  tc_attachTimestamp(struct __sk_buff *skb){
 
@@ -100,9 +180,14 @@ int  tc_attachTimestamp(struct __sk_buff *skb){
         }
         ip_tot_len &= 0xFFF; /* Max 4095 */
 
-        /* Finding end of packet + offset, and bound access */
-        if ((void *)iphdr + (ip_tot_len) > data_end) {
-            bpf_printk(">data_end");
+        // int oldChecksum = parse_icmphdr(&nh,data_end,&icmp_header);
+        // if(oldChecksum<0){
+        //     return TC_ACT_SHOT;
+        // }
+        // bpf_printk("Old Checksum : %llu",oldChecksum);
+
+
+        if((void *)iphdr + ip_tot_len > data_end){
             return TC_ACT_SHOT;
         }
 
@@ -111,39 +196,57 @@ int  tc_attachTimestamp(struct __sk_buff *skb){
         ts->time  = bpf_ktime_get_ns();
         bpf_printk("Time : %llu",ts->time);
 
-        __u16 ip_header_offset = iphdr->ihl * 4;  // ihl is in units of 4 bytes
+        __u8 ip_header_offset = (iphdr->ihl) * 4;  // ihl is in units of 4 bytes
 
-        if ((void *)iphdr + ip_header_offset + sizeof(struct icmphdr) > data_end) {
+        if ((void *)iphdr + ip_header_offset + (__u8)(sizeof(struct icmphdr)) > data_end) {
             // Packet too small, cannot access ICMP header
             return TC_ACT_OK;
         }
-
-        icmp_header = (void *)iphdr + ip_header_offset;
-        bpf_printk("Old Checksum : %llu",icmp_header->checksum);
-        // __u32 size = sizeof(struct icmphdr);
-        // __u32 new_csum = bpf_csum_diff(NULL,0,(__be32 *)icmp_header,size,0);
-        // icmp_header->checksum = ~new_csum;
-
         
+        icmp_header = (void *)iphdr + ip_header_offset;
+
+        // bpf_l4_csum_replace(skb, ICMP_CSUM_OFF, 0, 0, ICMP_CSUM_SIZE);
+
         icmp_header->checksum = 0;
         __u32 csum = 0;
-        __u8 *next_icmp_u8 = (__u8 *)icmp_header;
+        int count= ip_tot_len - ip_header_offset;
+        __u16 * addr = (__u16*)icmp_header;
+        if((void *)addr + count >= data_end){
+            return TC_ACT_OK;
+        }
+        // while (count > 1) {
+        //     count -= 2;
+        //     if(count!=0)csum += *addr++;
+        // }
 
-        for (int i = 0; i < sizeof(struct icmphdr); i++) {
-            // bpf_printk("Content : %llu",*next_icmp_u8);
-            csum += *next_icmp_u8++;
-        }
-        // Check if there's data payload after the ICMP header
-        int icmp_data_len = ip_tot_len - ip_header_offset - sizeof(struct icmphdr);
-        if (icmp_data_len > 0) {
-            next_icmp_u8 = (__u8 *)icmp_header + sizeof(struct icmphdr);
-            // Include data payload in checksum calculation
-            for (int i = 0; i < icmp_data_len; i++) {
-                csum += *next_icmp_u8++;
-            }
-            // bpf_printk("Content Size: %llu",data_end - (void *)next_icmp_u8);
-        }
-        icmp_header->checksum = ~((csum & 0xffff) + (csum >> 16));
+        // if (count > 0) {
+        //     csum +=   (*(__u8*) addr)<<8;
+        // }
+        
+
+        csum = (csum & 0xffff) + (csum >> 16);
+        // csum = icmp_header->type + icmp_header->code + icmp_header->un.echo.id + icmp_header->un.echo.sequence;
+
+        // __u8 *next_icmp_u8 = (__u8 *)(icmp_header);
+        // __u16 icmp_offset = sizeof(struct icmphdr);
+        // int iterations = icmp_offset;
+        // for(int i=0;i<iterations;i++)csum += next_icmp_u8[i];
+        // if((void *)icmp_header + (icmp_offset) > data_end){
+        //     return TC_ACT_SHOT;
+        // }
+        // next_icmp_u8 = (__u8*)((void *)(icmp_header) + icmp_offset + 1);
+        // if((void *)next_icmp_u8 > data_end) return TC_ACT_SHOT;
+        // else{
+        //     int iterations = ip_tot_len - (ip_header_offset + icmp_offset);
+        //     if(iterations<=0)return TC_ACT_SHOT;
+        //     else{
+        //         for (int i = 0; i < iterations; i++) {
+        //             csum += next_icmp_u8[i];
+        //         }
+        //     }
+        // }   
+        // icmp_header->checksum = ~((csum & 0xffff) + (csum >> 16));
+        icmp_header->checksum = ~csum;
         bpf_printk("New Checksum : %llu",icmp_header->checksum);
     }
     return TC_ACT_OK;
