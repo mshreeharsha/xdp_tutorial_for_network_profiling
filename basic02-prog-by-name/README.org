@@ -1,0 +1,10 @@
+To generate Object files : 
+cd to the folder 'basic02-prog-by-name' and run make. 
+This generates the object file.  
+
+For loading the object file, commands :  
+tc qdisc add dev veth0 clsact (Note: veth0 is my virtual interface created)  
+tc filter add dev veth0 egress bpf da obj <location of object file> section tc  
+
+For deleting the loaded object file :  
+tc qdisc del dev veth0 clsact
